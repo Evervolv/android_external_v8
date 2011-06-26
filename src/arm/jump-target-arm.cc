@@ -50,14 +50,27 @@ void JumpTarget::DoJump() {
   ASSERT(cgen()->HasValidEntryRegisters());
 
   if (entry_frame_set_) {
+    if (entry_label_.is_bound()) {
+      // If we already bound and generated code at the destination then it
+      // is too late to ask for less optimistic type assumptions.
+      ASSERT(entry_frame_.IsCompatibleWith(cgen()->frame()));
+    }
     // There already a frame expectation at the target.
     cgen()->frame()->MergeTo(&entry_frame_);
     cgen()->DeleteFrame();
   } else {
     // Clone the current frame to use as the expected one at the target.
     set_entry_frame(cgen()->frame());
+    // Zap the fall-through frame since the jump was unconditional.
     RegisterFile empty;
     cgen()->SetFrame(NULL, &empty);
+  }
+  if (entry_label_.is_bound()) {
+    // You can't jump backwards to an already bound label unless you admitted
+    // up front that this was a bidirectional jump target.  Bidirectional jump
+    // targets will zap their type info when bound in case some later virtual
+    // frame with less precise type info branches to them.
+    ASSERT(direction_ != FORWARD_ONLY);
   }
   __ jmp(&entry_label_);
 }
@@ -67,20 +80,28 @@ void JumpTarget::DoBranch(Condition cc, Hint ignored) {
   ASSERT(cgen()->has_valid_frame());
 
   if (entry_frame_set_) {
-    // Backward branch.  We have an expected frame to merge to on the
-    // backward edge.
-    if (cc == al) {
-      cgen()->frame()->MergeTo(&entry_frame_);
-    } else {
-      // We can't do conditional merges yet so you have to ensure that all
-      // conditional branches to the JumpTarget have the same virtual frame.
-      ASSERT(cgen()->frame()->Equals(&entry_frame_));
+    if (entry_label_.is_bound()) {
+      // If we already bound and generated code at the destination then it
+      // is too late to ask for less optimistic type assumptions.
+      ASSERT(entry_frame_.IsCompatibleWith(cgen()->frame()));
     }
+    // We have an expected frame to merge to on the backward edge.
+    cgen()->frame()->MergeTo(&entry_frame_, cc);
   } else {
     // Clone the current frame to use as the expected one at the target.
     set_entry_frame(cgen()->frame());
   }
+  if (entry_label_.is_bound()) {
+    // You can't branch backwards to an already bound label unless you admitted
+    // up front that this was a bidirectional jump target.  Bidirectional jump
+    // targets will zap their type info when bound in case some later virtual
+    // frame with less precise type info branches to them.
+    ASSERT(direction_ != FORWARD_ONLY);
+  }
   __ b(cc, &entry_label_);
+  if (cc == al) {
+    cgen()->DeleteFrame();
+  }
 }
 
 
@@ -115,12 +136,23 @@ void JumpTarget::DoBind() {
   ASSERT(!cgen()->has_valid_frame() || cgen()->HasValidEntryRegisters());
 
   if (cgen()->has_valid_frame()) {
+    if (direction_ != FORWARD_ONLY) cgen()->frame()->ForgetTypeInfo();
     // If there is a current frame we can use it on the fall through.
     if (!entry_frame_set_) {
       entry_frame_ = *cgen()->frame();
       entry_frame_set_ = true;
     } else {
       cgen()->frame()->MergeTo(&entry_frame_);
+      // On fall through we may have to merge both ways.
+      if (direction_ != FORWARD_ONLY) {
+        // This will not need to adjust the virtual frame entries that are
+        // register allocated since that was done above and they now match.
+        // But it does need to adjust the entry_frame_ of this jump target
+        // to make it potentially less optimistic.  Later code can branch back
+        // to this jump target and we need to assert that that code does not
+        // have weaker assumptions about types.
+        entry_frame_.MergeTo(cgen()->frame());
+      }
     }
   } else {
     // If there is no current frame we must have an entry frame which we can
